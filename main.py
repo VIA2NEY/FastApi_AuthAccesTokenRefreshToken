@@ -4,7 +4,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
 from datetime import datetime, timedelta
-from uuid import uuid4
+from typing import Dict
 
 # Setup
 SECRET_KEY = "your-secret-key"
@@ -41,8 +41,8 @@ fake_users_db = {
     }
 }
 
-# Refresh token storage (replace with database in production)
-refresh_tokens = {}
+# Token storage
+active_tokens: Dict[str, Dict[str, str]] = {}
 
 # Helper functions
 def verify_password(plain_password, hashed_password):
@@ -72,6 +72,10 @@ def create_access_token(data: dict):
 def create_refresh_token(data: dict):
     return create_token(data, timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS), "refresh")
 
+def invalidate_tokens(username: str):
+    if username in active_tokens:
+        del active_tokens[username]
+
 # Dependency
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
@@ -84,6 +88,8 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         username: str = payload.get("sub")
         token_type: str = payload.get("type")
         if username is None or token_type != "access":
+            raise credentials_exception
+        if username not in active_tokens or active_tokens[username]["access_token"] != token:
             raise credentials_exception
         token_data = TokenData(username=username)
     except JWTError:
@@ -106,8 +112,9 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     access_token = create_access_token(data={"sub": user.username})
     refresh_token = create_refresh_token(data={"sub": user.username})
     
-    # Store refresh token (in production, save to database)
-    refresh_tokens[refresh_token] = user.username
+    # Invalidate old tokens and store new ones
+    invalidate_tokens(user.username)
+    active_tokens[user.username] = {"access_token": access_token, "refresh_token": refresh_token}
     
     return {"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"}
 
@@ -117,16 +124,15 @@ async def refresh_token(refresh_token: str):
         payload = jwt.decode(refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
         token_type: str = payload.get("type")
-        if username is None or token_type != "refresh" or refresh_token not in refresh_tokens:
+        if username is None or token_type != "refresh" or username not in active_tokens or active_tokens[username]["refresh_token"] != refresh_token:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
         
         # Create new tokens
         new_access_token = create_access_token(data={"sub": username})
         new_refresh_token = create_refresh_token(data={"sub": username})
         
-        # Invalidate old refresh token and store new one
-        del refresh_tokens[refresh_token]
-        refresh_tokens[new_refresh_token] = username
+        # Invalidate old tokens and store new ones
+        active_tokens[username] = {"access_token": new_access_token, "refresh_token": new_refresh_token}
         
         return {"access_token": new_access_token, "refresh_token": new_refresh_token, "token_type": "bearer"}
     except JWTError:
@@ -135,3 +141,8 @@ async def refresh_token(refresh_token: str):
 @app.get("/users/me")
 async def read_users_me(current_user: User = Depends(get_current_user)):
     return current_user
+
+@app.post("/logout")
+async def logout(current_user: User = Depends(get_current_user)):
+    invalidate_tokens(current_user.username)
+    return {"message": "Successfully logged out"}
